@@ -10,6 +10,7 @@ password_found_event = threading.Event()
 
 def identify_hash(hash_value):
     print(f"Identifying hash: {hash_value}")
+    # Adjust each of these for salt if necessary
     if re.match(r'^[a-fA-F0-9]{32}$', hash_value):
         return 'md5'
     elif re.match(r'^[a-fA-F0-9]{40}$', hash_value):
