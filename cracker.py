@@ -4,13 +4,14 @@ import threading
 import re
 import time
 import bcrypt
+import multiprocessing
 
-# Global variable to track if a password is found
-password_found_event = threading.Event()
+# Dictionary to store cracked passwords
+cracked_passwords = {}
+lock = threading.Lock()  # Ensure thread-safe access to cracked_passwords
 
 def identify_hash(hash_value):
     print(f"Identifying hash: {hash_value}")
-    # Adjust each of these for salt if necessary
     if re.match(r'^[a-fA-F0-9]{32}$', hash_value):
         return 'md5'
     elif re.match(r'^[a-fA-F0-9]{40}$', hash_value):
@@ -21,85 +22,73 @@ def identify_hash(hash_value):
         return 'sha384'
     elif re.match(r'^[a-fA-F0-9]{128}$', hash_value):
         return 'sha512'
-    elif re.match(r'^\$2a\$\d+\$[a-zA-Z0-9./]{53}$', hash_value):
+    elif re.match(r'^\$2[ayb]\$\d{2}\$[a-zA-Z0-9./]{53}$', hash_value):  # More generic bcrypt regex
         return 'bcrypt'
     else:
         return None
 
 def check_bcrypt_hash(password, hash_value):
     if bcrypt.checkpw(password.encode('utf-8'), hash_value.encode('utf-8')):
+        with lock:
+            cracked_passwords[hash_value] = password
         print(f"[+] Password cracked for bcrypt hash: {hash_value} -> {password}")
-        password_found_event.set()  # Signal that a password has been found
-    else:
-        print("[-] Password does not match for bcrypt hash.")
 
 def check_online(hash_value):
     url = f'https://weakpass.com/api/v1/search/{hash_value}'
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
 
     try:
         response = requests.get(url, headers=headers)
-        print(f"[+] Response status code: {response.status_code}")
-
         if response.status_code == 200:
-            if not response.text.strip():  # Check if response is empty
-                print(f"[-] Empty response from WeakPass for {hash_value}")
-                return False
-            
-            try:
-                data = response.json()
-                if isinstance(data, dict) and 'data' in data and 'password' in data['data']:
-                    print(f"[+] Password found: {data['data']['password']}")
-                    password_found_event.set()
-                    return True
-            except requests.exceptions.JSONDecodeError:
-                print(f"[-] Invalid JSON response for {hash_value}: {response.text}")
-                return False
+            data = response.json()
+            if isinstance(data, dict) and 'data' in data and 'password' in data['data']:
+                with lock:
+                    cracked_passwords[hash_value] = data['data']['password']
+                print(f"[+] Online match: {hash_value} -> {data['data']['password']}")
+                return True
         elif response.status_code == 404:
-            print(f"[-] Password not found for {hash_value}")
-        else:
-            print(f"[-] Unexpected response {response.status_code}: {response.text}")
+            print(f"[-] No match found online for {hash_value}")
     except Exception as e:
-        print(f"[-] Request error: {e}")
-
+        print(f"[-] Online check error: {e}")
+    
     return False
+
+def process_password_chunk(chunk, hashes):
+    for password in chunk:
+        for hash_value in hashes:
+            hash_type = identify_hash(hash_value)
+            if hash_type == 'bcrypt':
+                check_bcrypt_hash(password, hash_value)
+            elif hash_type:
+                check_online(hash_value)
+            else:
+                print(f"[-] Unknown hash type for {hash_value}")
+            time.sleep(0.1)
+
+    print(f"[*] Process {multiprocessing.current_process().name} completed.")
 
 def wordlist_attack(hashes, wordlist_url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
+    """Download wordlist and split it across CPU cores."""
+    response = requests.get(wordlist_url)
+    response.raise_for_status()
+    
+    wordlist = response.text.splitlines()
+    num_cores = multiprocessing.cpu_count()
+    
+    chunk_size = len(wordlist) // num_cores
+    chunks = [wordlist[i:i+chunk_size] for i in range(0, len(wordlist) - chunk_size, chunk_size)]
+    chunks.append(wordlist[len(chunks) * chunk_size:])
 
-    try:
-        response = requests.get(wordlist_url, headers=headers)
-        response.raise_for_status()  # Raises an error for bad responses
-        wordlist = [password.strip() for password in response.text.split('\n') if password.strip()]
-        
-        for password in wordlist:
-            if password_found_event.is_set():
-                break
-            for hash_value in hashes:
-                # Identify the hash type
-                hash_type = identify_hash(hash_value.strip())
-                
-                if hash_type == 'bcrypt':
-                    # Check bcrypt hash
-                    check_bcrypt_hash(password, hash_value.strip())
-                    if password_found_event.is_set():  # Stop if password is found
-                        return True
-                else:
-                    # Check online for other hash types
-                    if check_online(hash_value.strip()):
-                        return True
-            time.sleep(1)  # Avoid hitting rate limits
-    except requests.RequestException as e:
-        print(f"[-] Error downloading wordlist: {e}")
+    processes = []
+    for chunk in chunks:
+        p = multiprocessing.Process(target=process_password_chunk, args=(chunk, hashes))
+        processes.append(p)
+        p.start()
 
-    return False
+    for p in processes:
+        p.join()
 
 def main():
-    # Load hashes from file
     hashes_file = input("[*] Enter the path to the hashes file: ")
     with open(hashes_file, 'r') as f:
         hashes = f.read().splitlines()
@@ -112,23 +101,23 @@ def main():
         "https://weakpass.com/api/v1/wordlists/rockyou.txt"
     ]
 
-    # Loop through each wordlist
     threads = []
     for wordlist_url in wordlists:
-        # Use a separate thread for each wordlist
         thread = threading.Thread(target=wordlist_attack, args=(hashes, wordlist_url))
         threads.append(thread)
         thread.start()
 
-    # Wait for all threads to finish or stop early if password is found
     for thread in threads:
         thread.join()
 
-    if password_found_event.is_set():
-        print("[+] Password found and cracked!")
-        input("[*] Press Enter to exit...")
+    # Print all cracked passwords
+    if cracked_passwords:
+        print("\n[+] Cracked passwords:")
+        for h, p in cracked_passwords.items():
+            print(f"{h} -> {p}")
     else:
-        print("[-] No password found.")
+        print("[-] No passwords were cracked.")
 
 if __name__ == '__main__':
     main()
+
